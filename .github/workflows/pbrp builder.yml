@@ -1,4 +1,4 @@
-name: PBRP Builder
+name: PBRP Builder (Max Speed)
 
 on:
   workflow_dispatch:
@@ -56,8 +56,8 @@ on:
         description: 'Kernel path'
         required: false
         default: ''
-      ENABLE_CCACHE:
-        description: 'Enable ccache?'
+      ENABLE_SCCACHE:
+        description: 'Enable sccache?'
         required: true
         type: boolean
         default: true
@@ -92,13 +92,14 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OUT: android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}
       BUILD_DATE: ${{ github.run_id }}
+      SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@v4
 
     - uses: rokibhasansagar/slimhub_actions@main
 
     - uses: pierotofy/set-swap-space@master
-      with: { swap-size-gb: 24 }
+      with: { swap-size-gb: 32 }
 
     - name: Prepare environment
       run: |
@@ -107,35 +108,53 @@ jobs:
           linux-modules-extra-$(uname -r) python3-pip cpio lz4 unzip gperf \
           gcc-multilib gcc-10-multilib g++-multilib g++-10-multilib libc6-dev \
           lib32ncurses-dev x11proto-core-dev libx11-dev tree lib32z-dev \
-          libgl1-mesa-dev libxml2-utils xsltproc bc ccache lib32readline-dev \
+          libgl1-mesa-dev libxml2-utils xsltproc bc lib32readline-dev \
           lib32z1-dev liblz4-tool libncurses-dev libsdl1.2-dev build-essential \
           libgtk-3-dev libglu1-mesa-dev freeglut3-dev git libxml2 lzop pngcrush \
           schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp \
           qemu-user-static libstdc++-10-dev libncurses6 python3 tar
+        sudo ln -sf /usr/bin/python3 /usr/bin/python2
+        mkdir -p ~/bin
+        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        sudo ln -sf ~/bin/repo /usr/bin/repo
 
     - uses: actions/setup-java@v4
       with:
         distribution: zulu
         java-version: ${{ inputs.ANDROID_VERSION == '14' && '17' || '11' }}
 
-    - name: Install repo
-      run: |
-        mkdir -p ~/bin
-        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-        chmod a+x ~/bin/repo
-        sudo ln -sf ~/bin/repo /usr/bin/repo
+    - name: Cache repo
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/repo
+        key: repo-${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}
+        restore-keys: |
+          repo-${{ inputs.MANIFEST_BRANCH }}-
 
-    - name: Init + sync
+    - name: Init + sync (fallback)
       run: |
         mkdir android-recovery && cd android-recovery
         git config --global user.name "${{ github.actor }}"
         git config --global user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
         git config --global http.postBuffer 524288000
-        git config --global http.lowSpeedLimit 1000
-        git config --global http.lowSpeedTime 300
+        git config --global http.lowSpeedLimit 0
+        git config --global http.lowSpeedTime 999999
         export GIT_TERMINAL_PROMPT=0
-        repo init --depth=1 -u https://github.com/PitchBlackRecoveryProject/manifest_pb.git -b ${{ inputs.MANIFEST_BRANCH }}
-        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+        repo init --depth=1 --partial-clone --clone-filter=blob:limit=10M --no-use-superproject \
+          -u https://github.com/PitchBlackRecoveryProject/manifest_pb.git \
+          -b ${{ inputs.MANIFEST_BRANCH }}
+
+        if repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags; then
+          echo "Sync OK (all threads)"
+        elif repo sync -c -j2 --force-sync --no-clone-bundle --no-tags; then
+          echo "Sync OK (j2)"
+        elif repo sync -c -j1 --force-sync --no-clone-bundle --no-tags; then
+          echo "Sync OK (j1)"
+        else
+          echo "SYNC FAILED: all attempts exhausted"
+          exit 1
+        fi
 
     - name: Clone device tree (manual)
       if: ${{ fromJSON(inputs.USE_TWRPDTGEN) == false }}
@@ -159,17 +178,17 @@ jobs:
         cp -r $TREE/* android-recovery/${{ inputs.DEVICE_PATH }}/
         echo "COMMIT_ID=Generated-by-twrpdtgen" >> $GITHUB_ENV
 
-    - name: Clone kernel (optional)
-      if: inputs.KERNEL_TREE != ''
-      run: |
-        cd android-recovery
-        mkdir -p $(dirname ${{ inputs.KERNEL_PATH }})
-        git clone ${{ inputs.KERNEL_TREE }} -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_PATH }} --depth=1
-
-    - name: Patch BoardConfig.mk
+    - name: Fix device tree & patch BoardConfig
       env: { FLAGS: '${{ inputs.EXTRA_BUILD_FLAGS }}' }
       run: |
         cd android-recovery/${{ inputs.DEVICE_PATH }}
+        find . -name "*.mk" -exec sed -i 's|vendor/omni/config/common.mk|vendor/pb/config/common.mk|g' {} +
+        [ -f vendorsetup.sh ] && rm -f vendorsetup.sh
+        MK=$(find . -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
+        if [ -n "$MK" ]; then
+          PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
+          grep -q "COMMON_LUNCH_CHOICES" AndroidProducts.mk || echo "COMMON_LUNCH_CHOICES := ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng" >> AndroidProducts.mk
+        fi
         {
           echo "# --- Injected ---"
           echo "PLATFORM_VERSION := ${{ inputs.ANDROID_VERSION }}"
@@ -183,49 +202,54 @@ jobs:
           }
           [ -n "$FLAGS" ] && printf '%s\n' "$FLAGS"
         } >> BoardConfig.mk
-        tail -20 BoardConfig.mk
 
-    - name: Detect makefile and lunch prefix
+    - name: Clone kernel (optional)
+      if: inputs.KERNEL_TREE != ''
       run: |
         cd android-recovery
-        MK=$(find ${{ inputs.DEVICE_PATH }} -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
-        [ -z "$MK" ] && { echo "No makefile for ${{ inputs.DEVICE_NAME }}"; exit 1; }
-        PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
-        echo "DEVICE_MAKEFILE=${PREFIX}_${{ inputs.DEVICE_NAME }}" >> $GITHUB_ENV
-        echo "Detected prefix: $PREFIX"
+        mkdir -p $(dirname ${{ inputs.KERNEL_PATH }})
+        git clone ${{ inputs.KERNEL_TREE }} -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_PATH }} --depth=1
 
-    - name: Fetch fonts
-      continue-on-error: true
-      run: |
-        cd android-recovery
-        mkdir -p external/noto-fonts/{other,others}
-        wget -q --tries=3 https://github.com/cd-Crypton/custom-recovery-extras/raw/main/missing-font.zip -O f.zip \
-          && unzip -oq f.zip -d external/noto-fonts/other/ \
-          && cp -r external/noto-fonts/other/* external/noto-fonts/others/ 2>/dev/null
-        rm -f f.zip
-
-    - name: Setup ccache
-      if: ${{ fromJSON(inputs.ENABLE_CCACHE) == true }}
-      uses: hendrikmuhs/ccache-action@v1.2.22
+    - name: Setup sccache
+      if: ${{ fromJSON(inputs.ENABLE_SCCACHE) == true }}
+      uses: hendrikmuhs/ccache-action@v1.2.23
       with:
+        variant: sccache
         max-size: 10G
-        key: ccache-${{ inputs.DEVICE_NAME }}-${{ inputs.MANIFEST_BRANCH }}
-        restore-keys: ccache-${{ inputs.DEVICE_NAME }}-
+        key: sccache-${{ inputs.DEVICE_NAME }}-${{ inputs.MANIFEST_BRANCH }}
+        restore-keys: |
+          sccache-${{ inputs.DEVICE_NAME }}-
 
-    - name: Build
+    - name: Link ccache to sccache
+      if: ${{ fromJSON(inputs.ENABLE_SCCACHE) == true }}
+      run: |
+        SCCACHE_PATH=$(which sccache)
+        sudo mkdir -p /usr/lib/ccache
+        sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/ccache
+        sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/gcc
+        sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/g++
+        echo "Symlinked ccache/gcc/g++ -> sccache"
+
+    - name: Build (max speed)
       run: |
         cd android-recovery
         source build/envsetup.sh
         export ALLOW_MISSING_DEPENDENCIES=true
-        [ "${{ fromJSON(inputs.ENABLE_CCACHE) }}" = "true" ] && { export USE_CCACHE=1 CCACHE_EXEC=$(which ccache) CCACHE_DIR=$HOME/.ccache; }
-        lunch ${{ env.DEVICE_MAKEFILE }}-eng && mka pbrp
+        if [ "${{ fromJSON(inputs.ENABLE_SCCACHE) }}" = "true" ]; then
+          export USE_CCACHE=1
+          export SCCACHE_DIR=$HOME/.cache/sccache
+          export SCCACHE_IGNORE_SERVER_IO_ERROR=1
+          export PATH="/usr/lib/ccache:$PATH"
+        fi
+        MK=$(find ${{ inputs.DEVICE_PATH }} -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
+        PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
+        lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) pbrp
 
     - name: Verify output
       run: |
         cd $OUT
         F=${{ inputs.BUILD_TARGET == 'vendorboot' && 'vendor_boot.img' || format('{0}.img', inputs.BUILD_TARGET) }}
         [ -s "$F" ] || { echo "Missing/empty: $F"; exit 1; }
-        echo "OK: $F ($(du -h $F | cut -f1))"
 
     - uses: actions/upload-artifact@v4
       if: failure()
@@ -255,23 +279,12 @@ jobs:
         body: |
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
           Tree: ${{ inputs.USE_TWRPDTGEN == 'true' && 'twrpdtgen' || 'Manual' }}
-          Source: ${{ inputs.USE_TWRPDTGEN == 'true' && inputs.IMAGE_URL || env.COMMIT_ID }}
-
-    - name: LDCheck
-      if: inputs.LDCHECK != ''
-      continue-on-error: true
-      run: |
-        [ -f tools/ldcheck ] || { echo "ldcheck not found"; exit 0; }
-        D=$OUT/recovery/root
-        mv -n tools/libneeds tools/ldcheck $D/ 2>/dev/null || true
-        cd $D
-        python3 ldcheck -p system/lib64:vendor/lib64:system/lib:vendor/lib -d ${{ inputs.LDCHECK }}
 
     - name: Summary
       if: always()
       run: |
         {
-          echo "### PBRP Build"
+          echo "### PBRP Build (Max Speed)"
           echo "| Field | Value |"
           echo "| --- | --- |"
           echo "| Device | ${{ inputs.DEVICE_NAME }} |"
