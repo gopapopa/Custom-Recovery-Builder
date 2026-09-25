@@ -164,7 +164,11 @@ jobs:
     - name: Repo Sync
       run: |
         cd android-recovery
-        repo sync -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+        git config --global http.postBuffer 524288000
+        git config --global http.lowSpeedLimit 1000
+        git config --global http.lowSpeedTime 300
+        export GIT_TERMINAL_PROMPT=0
+        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags --depth=1
 
     - name: Clone Device Tree (Manual)
       if: inputs.USE_TWRPDTGEN == false
@@ -178,11 +182,11 @@ jobs:
     - name: Generate Device Tree via twrpdtgen
       if: inputs.USE_TWRPDTGEN == true
       run: |
-        sudo pip3 install twrpdtgen gdown --break-system-packages || sudo pip3 install twrpdtgen gdown
+        sudo pip3 install twrpdtgen gdown
         
         echo "Downloading stock image..."
         if [[ "${{ inputs.IMAGE_URL }}" == *"drive.google.com"* ]]; then
-          gdown --fuzzy "${{ inputs.IMAGE_URL }}" -O stock_image.img
+          gdown "${{ inputs.IMAGE_URL }}" -O stock_image.img
         else
           wget -q "${{ inputs.IMAGE_URL }}" -O stock_image.img
         fi
