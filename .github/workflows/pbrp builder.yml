@@ -1,4 +1,4 @@
-name: PBRP Builder (Max Speed)
+name: PBRP Builder
 
 on:
   workflow_dispatch:
@@ -182,8 +182,11 @@ jobs:
       env: { FLAGS: '${{ inputs.EXTRA_BUILD_FLAGS }}' }
       run: |
         cd android-recovery/${{ inputs.DEVICE_PATH }}
+        # Replace omni vendor path with pb
         find . -name "*.mk" -exec sed -i 's|vendor/omni/config/common.mk|vendor/pb/config/common.mk|g' {} +
+        # Remove obsolete vendorsetup.sh
         [ -f vendorsetup.sh ] && rm -f vendorsetup.sh
+        # Ensure COMMON_LUNCH_CHOICES
         MK=$(find . -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
         if [ -n "$MK" ]; then
           PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
@@ -230,7 +233,7 @@ jobs:
         sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/g++
         echo "Symlinked ccache/gcc/g++ -> sccache"
 
-    - name: Build (max speed)
+    - name: Build
       run: |
         cd android-recovery
         source build/envsetup.sh
@@ -243,7 +246,7 @@ jobs:
         fi
         MK=$(find ${{ inputs.DEVICE_PATH }} -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
         PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
-        lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) pbrp
+        lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka pbrp
 
     - name: Verify output
       run: |
@@ -284,7 +287,7 @@ jobs:
       if: always()
       run: |
         {
-          echo "### PBRP Build (Max Speed)"
+          echo "### PBRP Build"
           echo "| Field | Value |"
           echo "| --- | --- |"
           echo "| Device | ${{ inputs.DEVICE_NAME }} |"
