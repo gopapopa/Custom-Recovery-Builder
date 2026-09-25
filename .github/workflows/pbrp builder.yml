@@ -95,7 +95,7 @@ on:
 jobs:
   build:
     name: ${{ inputs.RECOVERY_TYPE }} ${{ inputs.DEVICE_NAME }}
-    runs-on: ubuntu-latest # Исправлено: ubuntu-22.04 устарел
+    runs-on: ubuntu-latest
     if: github.event.repository.owner.id == github.event.sender.id
     permissions: { contents: write }
     env:
@@ -104,7 +104,7 @@ jobs:
       BUILD_DATE: ${{ github.run_id }}
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@v5 # Обновлено до v5
+    - uses: actions/checkout@v5
 
     - uses: rokibhasansagar/slimhub_actions@main
 
@@ -129,7 +129,7 @@ jobs:
         chmod a+x ~/bin/repo
         sudo ln -sf ~/bin/repo /usr/bin/repo
 
-    - uses: actions/setup-java@v5 # Обновлено до v5
+    - uses: actions/setup-java@v5
       with:
         distribution: zulu
         java-version: ${{ (inputs.ANDROID_VERSION == '14' || inputs.ANDROID_VERSION == '15' || inputs.ANDROID_VERSION == '16') && '17' || '11' }}
@@ -194,9 +194,11 @@ jobs:
           exit 1
         fi
         sudo pip3 install -q twrpdtgen gdown
-        [[ "${{ inputs.IMAGE_URL }}" == *"drive.google.com"* ]] \
-          && gdown "${{ inputs.IMAGE_URL }}" -O stock.img \
-          || wget -q "${{ inputs.IMAGE_URL }}" -O stock.img
+        if [[ "${{ inputs.IMAGE_URL }}" == *"drive.google.com"* ]]; then
+          gdown "${{ inputs.IMAGE_URL }}" -O stock.img
+        else
+          wget -q "${{ inputs.IMAGE_URL }}" -O stock.img
+        fi
         python3 -m twrpdtgen stock.img -o generated_dt
         TREE=$(find generated_dt -name AndroidProducts.mk -exec dirname {} \; | head -1)
         [ -z "$TREE" ] && { echo "twrpdtgen failed"; exit 1; }
@@ -212,9 +214,11 @@ jobs:
           exit 1
         fi
         sudo pip3 install -q dumpyara aospdtgen gdown
-        [[ "${{ inputs.FIRMWARE_URL }}" == *"drive.google.com"* ]] \
-          && gdown "${{ inputs.FIRMWARE_URL }}" -O firmware.zip \
-          || wget -q "${{ inputs.FIRMWARE_URL }}" -O firmware.zip
+        if [[ "${{ inputs.FIRMWARE_URL }}" == *"drive.google.com"* ]]; then
+          gdown "${{ inputs.FIRMWARE_URL }}" -O firmware.zip
+        else
+          wget -q "${{ inputs.FIRMWARE_URL }}" -O firmware.zip
+        fi
         python3 -m dumpyara firmware.zip
         DUMP=$(find . -maxdepth 2 -name dump -type d | head -1)
         [ -z "$DUMP" ] && { echo "dumpyara failed"; exit 1; }
@@ -278,10 +282,14 @@ jobs:
           echo "Renamed: lineage.dependencies -> ${PREFIX}.dependencies"
         fi
 
-        [ -f vendorsetup.sh ] && rm -f vendorsetup.sh && echo "Removed vendorsetup.sh"
+        if [ -f vendorsetup.sh ]; then
+          rm -f vendorsetup.sh
+          echo "Removed vendorsetup.sh"
+        fi
 
-        grep -q "COMMON_LUNCH_CHOICES" AndroidProducts.mk 2>/dev/null || \
+        if ! grep -q "COMMON_LUNCH_CHOICES" AndroidProducts.mk 2>/dev/null; then
           echo "COMMON_LUNCH_CHOICES := ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng" >> AndroidProducts.mk
+        fi
         echo "COMMON_LUNCH_CHOICES ensured"
 
         echo "=== Device tree fixed for ${{ inputs.RECOVERY_TYPE }} ==="
@@ -298,16 +306,25 @@ jobs:
           echo "# --- Injected ---"
           echo "PLATFORM_VERSION := ${{ inputs.ANDROID_VERSION }}"
           echo "ALLOW_MISSING_DEPENDENCIES := true"
-          [ -n "${{ inputs.SCREEN_RESOLUTION }}" ] && {
+
+          if [ -n "${{ inputs.SCREEN_RESOLUTION }}" ]; then
             echo "TARGET_SCREEN_WIDTH := $(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f1)"
             echo "TARGET_SCREEN_HEIGHT := $(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f2)"
-          }
-          [ "${{ inputs.IS_AB_DEVICE }}" = "true" ] && {
+          fi
+
+          if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
             echo "BOARD_BUILD_SYSTEMROOT_IMAGE := true"
             echo "AB_OTA_UPDATER := true"
-          }
-          [ -n "$FLAGS" ] && printf '%s\n' "$FLAGS"
+          fi
+
+          if [ -n "$FLAGS" ]; then
+            printf '%s\n' "$FLAGS"
+          fi
+
+          true
         } >> BoardConfig.mk
+        echo "=== BoardConfig.mk patched ==="
+        tail -n 20 BoardConfig.mk
 
     - name: Clone kernel (optional)
       if: inputs.KERNEL_TREE != ''
@@ -375,7 +392,7 @@ jobs:
         F=${{ inputs.BUILD_TARGET == 'vendorboot' && 'vendor_boot.img' || format('{0}.img', inputs.BUILD_TARGET) }}
         [ -s "$F" ] || { echo "Missing/empty: $F"; exit 1; }
 
-    - uses: actions/upload-artifact@v5 # Обновлено до v5
+    - uses: actions/upload-artifact@v5
       if: failure()
       with:
         name: log-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
@@ -384,7 +401,7 @@ jobs:
           android-recovery/out/verbose.log
         retention-days: 7
 
-    - uses: actions/upload-artifact@v5 # Обновлено до v5
+    - uses: actions/upload-artifact@v5
       with:
         name: ${{ inputs.RECOVERY_TYPE }}-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
         path: |
