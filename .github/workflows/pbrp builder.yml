@@ -1,23 +1,40 @@
-name: PBRP Builder
+name: Recovery Builder (TWRP / PBRP / SHRP / OFRP)
 
 on:
   workflow_dispatch:
     inputs:
-      MANIFEST_BRANCH:
-        description: 'Manifest Branch'
+      RECOVERY_TYPE:
+        description: 'Recovery Type'
         required: true
-        default: 'android-11.0'
+        default: 'twrp'
         type: choice
-        options: [android-12.1, android-11.0]
-      USE_TWRPDTGEN:
-        description: 'Use twrpdtgen?'
+        options: [twrp, pbrp, shrp, ofrp]
+      MANIFEST_BRANCH:
+        description: 'Manifest Branch (version)'
         required: true
-        type: boolean
-        default: true
+        default: '12.1'
+        type: choice
+        options: ['14.1', '13.0', '12.1', '11.0', '10.0', '9.0']
+      TREE_GENERATOR:
+        description: 'Tree Generator'
+        required: true
+        default: 'manual'
+        type: choice
+        options: [manual, twrpdtgen, aospdtgen]
+      ANDROID_VERSION:
+        description: 'Target Android Version'
+        required: true
+        default: '12'
+        type: choice
+        options: ['16', '15', '14', '13', '12', '11', '10', '9']
       IMAGE_URL:
-        description: 'Stock image URL (twrpdtgen only)'
+        description: 'boot/recovery.img URL (twrpdtgen only)'
         required: false
-        default: 'https://drive.google.com/file/d/1DRIzOP1YfPn4qTjr3n_GJRQlmoN1yjBa/view?usp=drivesdk'
+        default: ''
+      FIRMWARE_URL:
+        description: 'Full firmware URL (aospdtgen only)'
+        required: false
+        default: ''
       DEVICE_TREE:
         description: 'Device tree repo (manual only)'
         required: false
@@ -25,21 +42,15 @@ on:
       DEVICE_TREE_BRANCH:
         description: 'Device tree branch'
         required: false
-        default: 'Android-11'
+        default: 'android-12.1'
       DEVICE_PATH:
-        description: 'Device path (e.g. device/samsung/gtowifi)'
+        description: 'Device path'
         required: true
         default: 'device/samsung/gtowifi'
       DEVICE_NAME:
-        description: 'Codename (e.g. gtowifi)'
+        description: 'Codename'
         required: true
         default: 'gtowifi'
-      ANDROID_VERSION:
-        description: 'Android version'
-        required: true
-        default: '11'
-        type: choice
-        options: ['14', '13', '12', '11', '10']
       SCREEN_RESOLUTION:
         description: 'Resolution WxH'
         required: true
@@ -67,10 +78,9 @@ on:
         type: boolean
         default: false
       EXTRA_BUILD_FLAGS:
-        description: 'Extra BoardConfig.mk flags'
+        description: 'Extra BoardConfig.mk flags (manual, one per line)'
         required: false
-        default: |
-          TW_NO_TOUCH_WAIT_FOR_QCOM := true
+        default: ''
       BUILD_TARGET:
         description: 'Build target'
         required: true
@@ -84,8 +94,8 @@ on:
 
 jobs:
   build:
-    name: PBRP ${{ inputs.DEVICE_NAME }}
-    runs-on: ubuntu-22.04
+    name: ${{ inputs.RECOVERY_TYPE }} ${{ inputs.DEVICE_NAME }}
+    runs-on: ubuntu-latest # Исправлено: ubuntu-22.04 устарел
     if: github.event.repository.owner.id == github.event.sender.id
     permissions: { contents: write }
     env:
@@ -94,7 +104,7 @@ jobs:
       BUILD_DATE: ${{ github.run_id }}
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5 # Обновлено до v5
 
     - uses: rokibhasansagar/slimhub_actions@main
 
@@ -112,27 +122,23 @@ jobs:
           lib32z1-dev liblz4-tool libncurses-dev libsdl1.2-dev build-essential \
           libgtk-3-dev libglu1-mesa-dev freeglut3-dev git libxml2 lzop pngcrush \
           schedtool squashfs-tools imagemagick libbz2-dev lzma ncftp \
-          qemu-user-static libstdc++-10-dev libncurses6 python3 tar
+          qemu-user-static libstdc++-10-dev libncurses6 python3 tar erofs-utils
         sudo ln -sf /usr/bin/python3 /usr/bin/python2
         mkdir -p ~/bin
         curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
         chmod a+x ~/bin/repo
         sudo ln -sf ~/bin/repo /usr/bin/repo
 
-    - uses: actions/setup-java@v4
+    - uses: actions/setup-java@v5 # Обновлено до v5
       with:
         distribution: zulu
-        java-version: ${{ inputs.ANDROID_VERSION == '14' && '17' || '11' }}
+        java-version: ${{ (inputs.ANDROID_VERSION == '14' || inputs.ANDROID_VERSION == '15' || inputs.ANDROID_VERSION == '16') && '17' || '11' }}
 
-    - name: Cache repo
-      uses: actions/cache@v4
-      with:
-        path: ~/.cache/repo
-        key: repo-${{ inputs.MANIFEST_BRANCH }}-${{ inputs.DEVICE_NAME }}
-        restore-keys: |
-          repo-${{ inputs.MANIFEST_BRANCH }}-
-
-    - name: Init + sync (fallback)
+    # ============================================================
+    # INIT + SYNC (repo-based: TWRP / PBRP / SHRP)
+    # ============================================================
+    - name: Init + sync (repo-based)
+      if: inputs.RECOVERY_TYPE != 'ofrp'
       run: |
         mkdir android-recovery && cd android-recovery
         git config --global user.name "${{ github.actor }}"
@@ -141,32 +147,52 @@ jobs:
         git config --global http.lowSpeedLimit 0
         git config --global http.lowSpeedTime 999999
         export GIT_TERMINAL_PROMPT=0
-        repo init --depth=1 --partial-clone --clone-filter=blob:limit=10M --no-use-superproject \
-          -u https://github.com/PitchBlackRecoveryProject/manifest_pb.git \
-          -b ${{ inputs.MANIFEST_BRANCH }}
 
+        if [ "${{ inputs.RECOVERY_TYPE }}" = "twrp" ]; then
+          MANIFEST="https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git"
+          BRANCH="twrp-${{ inputs.MANIFEST_BRANCH }}"
+        elif [ "${{ inputs.RECOVERY_TYPE }}" = "pbrp" ]; then
+          MANIFEST="https://github.com/PitchBlackRecoveryProject/manifest_pb.git"
+          BRANCH="android-${{ inputs.MANIFEST_BRANCH }}"
+        elif [ "${{ inputs.RECOVERY_TYPE }}" = "shrp" ]; then
+          MANIFEST="https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git"
+          BRANCH="twrp-${{ inputs.MANIFEST_BRANCH }}"
+        fi
+
+        echo "Manifest: $MANIFEST | Branch: $BRANCH"
+        repo init --depth=1 --partial-clone --clone-filter=blob:limit=10M --no-use-superproject -u "$MANIFEST" -b "$BRANCH"
         if repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags; then
-          echo "Sync OK (all threads)"
+          echo "Sync OK (all)"
         elif repo sync -c -j2 --force-sync --no-clone-bundle --no-tags; then
           echo "Sync OK (j2)"
         elif repo sync -c -j1 --force-sync --no-clone-bundle --no-tags; then
           echo "Sync OK (j1)"
         else
-          echo "SYNC FAILED: all attempts exhausted"
-          exit 1
+          echo "SYNC FAILED"; exit 1
         fi
 
-    - name: Clone device tree (manual)
-      if: ${{ fromJSON(inputs.USE_TWRPDTGEN) == false }}
+    # ============================================================
+    # INIT + SYNC (OrangeFox)
+    # ============================================================
+    - name: Init + sync (OrangeFox)
+      if: inputs.RECOVERY_TYPE == 'ofrp'
       run: |
-        cd android-recovery
-        mkdir -p $(dirname ${{ inputs.DEVICE_PATH }})
-        git clone ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ${{ inputs.DEVICE_PATH }}
-        echo "COMMIT_ID=$(git -C ${{ inputs.DEVICE_PATH }} rev-parse HEAD)" >> $GITHUB_ENV
+        git clone https://gitlab.com/OrangeFox/sync.git
+        cd sync
+        ./orangefox_sync.sh --branch ${{ inputs.MANIFEST_BRANCH }} --path ${{ github.workspace }}/android-recovery
+        cd ../android-recovery
+        echo "OrangeFox synced."
 
-    - name: Generate tree (twrpdtgen)
-      if: ${{ fromJSON(inputs.USE_TWRPDTGEN) == true }}
+    # ============================================================
+    # GENERATE TREE
+    # ============================================================
+    - name: twrpdtgen → Generate tree
+      if: inputs.TREE_GENERATOR == 'twrpdtgen'
       run: |
+        if [ "${{ inputs.ANDROID_VERSION }}" -gt 12 ]; then
+          echo "WARNING: twrpdtgen supports only Android 4.4–12."
+          exit 1
+        fi
         sudo pip3 install -q twrpdtgen gdown
         [[ "${{ inputs.IMAGE_URL }}" == *"drive.google.com"* ]] \
           && gdown "${{ inputs.IMAGE_URL }}" -O stock.img \
@@ -178,23 +204,100 @@ jobs:
         cp -r $TREE/* android-recovery/${{ inputs.DEVICE_PATH }}/
         echo "COMMIT_ID=Generated-by-twrpdtgen" >> $GITHUB_ENV
 
-    - name: Fix device tree & patch BoardConfig
+    - name: aospdtgen → Dump + generate tree
+      if: inputs.TREE_GENERATOR == 'aospdtgen'
+      run: |
+        if [ "${{ inputs.ANDROID_VERSION }}" -lt 8 ]; then
+          echo "WARNING: aospdtgen requires Treble (Android 8.0+)."
+          exit 1
+        fi
+        sudo pip3 install -q dumpyara aospdtgen gdown
+        [[ "${{ inputs.FIRMWARE_URL }}" == *"drive.google.com"* ]] \
+          && gdown "${{ inputs.FIRMWARE_URL }}" -O firmware.zip \
+          || wget -q "${{ inputs.FIRMWARE_URL }}" -O firmware.zip
+        python3 -m dumpyara firmware.zip
+        DUMP=$(find . -maxdepth 2 -name dump -type d | head -1)
+        [ -z "$DUMP" ] && { echo "dumpyara failed"; exit 1; }
+        python3 -m aospdtgen "$DUMP" -o generated_dt
+        TREE=$(find generated_dt -name AndroidProducts.mk -exec dirname {} \; | head -1)
+        [ -z "$TREE" ] && { echo "aospdtgen failed"; exit 1; }
+        mkdir -p android-recovery/${{ inputs.DEVICE_PATH }}
+        cp -r $TREE/* android-recovery/${{ inputs.DEVICE_PATH }}/
+        echo "COMMIT_ID=Generated-by-aospdtgen" >> $GITHUB_ENV
+
+    - name: manual → Clone device tree
+      if: inputs.TREE_GENERATOR == 'manual'
+      run: |
+        cd android-recovery
+        mkdir -p $(dirname ${{ inputs.DEVICE_PATH }})
+        git clone ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} ${{ inputs.DEVICE_PATH }}
+        echo "COMMIT_ID=$(git -C ${{ inputs.DEVICE_PATH }} rev-parse HEAD)" >> $GITHUB_ENV
+
+    # ============================================================
+    # FIX DEVICE TREE (автопатчи под каждый recovery)
+    # ============================================================
+    - name: Fix device tree
+      run: |
+        cd android-recovery/${{ inputs.DEVICE_PATH }}
+
+        if [ "${{ inputs.RECOVERY_TYPE }}" = "pbrp" ]; then
+          PREFIX="omni"
+          VENDOR_PATH="vendor/pb"
+        else
+          PREFIX="twrp"
+          VENDOR_PATH="vendor/twrp"
+        fi
+        echo "Target prefix: $PREFIX | Vendor path: $VENDOR_PATH"
+
+        find . -name "*.mk" -exec sed -i "s|vendor/omni/config/common.mk|${VENDOR_PATH}/config/common.mk|g" {} +
+        find . -name "*.mk" -exec sed -i "s|vendor/lineage/config/common.mk|${VENDOR_PATH}/config/common.mk|g" {} +
+        echo "Vendor path replaced -> ${VENDOR_PATH}"
+
+        OLD_PRODUCT=""
+        for f in omni_${{ inputs.DEVICE_NAME }}.mk lineage_${{ inputs.DEVICE_NAME }}.mk twrp_${{ inputs.DEVICE_NAME }}.mk; do
+          if [ -f "$f" ]; then
+            OLD_PRODUCT="$f"
+            break
+          fi
+        done
+
+        if [ -n "$OLD_PRODUCT" ]; then
+          NEW_PRODUCT="${PREFIX}_${{ inputs.DEVICE_NAME }}.mk"
+          if [ "$OLD_PRODUCT" != "$NEW_PRODUCT" ]; then
+            mv "$OLD_PRODUCT" "$NEW_PRODUCT"
+            echo "Renamed: $OLD_PRODUCT -> $NEW_PRODUCT"
+            sed -i "s|$(basename $OLD_PRODUCT)|$NEW_PRODUCT|g" AndroidProducts.mk
+            echo "AndroidProducts.mk updated"
+          fi
+        else
+          echo "WARNING: No product makefile found"
+        fi
+
+        if [ -f "lineage.dependencies" ]; then
+          mv "lineage.dependencies" "${PREFIX}.dependencies"
+          echo "Renamed: lineage.dependencies -> ${PREFIX}.dependencies"
+        fi
+
+        [ -f vendorsetup.sh ] && rm -f vendorsetup.sh && echo "Removed vendorsetup.sh"
+
+        grep -q "COMMON_LUNCH_CHOICES" AndroidProducts.mk 2>/dev/null || \
+          echo "COMMON_LUNCH_CHOICES := ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng" >> AndroidProducts.mk
+        echo "COMMON_LUNCH_CHOICES ensured"
+
+        echo "=== Device tree fixed for ${{ inputs.RECOVERY_TYPE }} ==="
+        cat AndroidProducts.mk
+
+    # ============================================================
+    # PATCH BOARD CONFIG
+    # ============================================================
+    - name: Patch BoardConfig.mk
       env: { FLAGS: '${{ inputs.EXTRA_BUILD_FLAGS }}' }
       run: |
         cd android-recovery/${{ inputs.DEVICE_PATH }}
-        # Replace omni vendor path with pb
-        find . -name "*.mk" -exec sed -i 's|vendor/omni/config/common.mk|vendor/pb/config/common.mk|g' {} +
-        # Remove obsolete vendorsetup.sh
-        [ -f vendorsetup.sh ] && rm -f vendorsetup.sh
-        # Ensure COMMON_LUNCH_CHOICES
-        MK=$(find . -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
-        if [ -n "$MK" ]; then
-          PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
-          grep -q "COMMON_LUNCH_CHOICES" AndroidProducts.mk || echo "COMMON_LUNCH_CHOICES := ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng" >> AndroidProducts.mk
-        fi
         {
           echo "# --- Injected ---"
           echo "PLATFORM_VERSION := ${{ inputs.ANDROID_VERSION }}"
+          echo "ALLOW_MISSING_DEPENDENCIES := true"
           [ -n "${{ inputs.SCREEN_RESOLUTION }}" ] && {
             echo "TARGET_SCREEN_WIDTH := $(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f1)"
             echo "TARGET_SCREEN_HEIGHT := $(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f2)"
@@ -213,26 +316,30 @@ jobs:
         mkdir -p $(dirname ${{ inputs.KERNEL_PATH }})
         git clone ${{ inputs.KERNEL_TREE }} -b ${{ inputs.KERNEL_BRANCH }} ${{ inputs.KERNEL_PATH }} --depth=1
 
+    # ============================================================
+    # SCCACHE
+    # ============================================================
     - name: Setup sccache
       if: ${{ fromJSON(inputs.ENABLE_SCCACHE) == true }}
       uses: hendrikmuhs/ccache-action@v1.2.23
       with:
         variant: sccache
         max-size: 10G
-        key: sccache-${{ inputs.DEVICE_NAME }}-${{ inputs.MANIFEST_BRANCH }}
-        restore-keys: |
-          sccache-${{ inputs.DEVICE_NAME }}-
+        key: sccache-${{ inputs.DEVICE_NAME }}-${{ inputs.RECOVERY_TYPE }}-${{ inputs.MANIFEST_BRANCH }}
+        restore-keys: sccache-${{ inputs.DEVICE_NAME }}-
 
-    - name: Link ccache to sccache
+    - name: Link ccache → sccache
       if: ${{ fromJSON(inputs.ENABLE_SCCACHE) == true }}
       run: |
-        SCCACHE_PATH=$(which sccache)
+        S=$(which sccache)
         sudo mkdir -p /usr/lib/ccache
-        sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/ccache
-        sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/gcc
-        sudo ln -sf "$SCCACHE_PATH" /usr/lib/ccache/g++
-        echo "Symlinked ccache/gcc/g++ -> sccache"
+        sudo ln -sf "$S" /usr/lib/ccache/ccache
+        sudo ln -sf "$S" /usr/lib/ccache/gcc
+        sudo ln -sf "$S" /usr/lib/ccache/g++
 
+    # ============================================================
+    # BUILD
+    # ============================================================
     - name: Build
       run: |
         cd android-recovery
@@ -246,7 +353,21 @@ jobs:
         fi
         MK=$(find ${{ inputs.DEVICE_PATH }} -maxdepth 1 -name "*_${{ inputs.DEVICE_NAME }}.mk" ! -name AndroidProducts.mk | head -1)
         PREFIX=$(basename "$MK" | sed "s/_${{ inputs.DEVICE_NAME }}\.mk//")
-        lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka pbrp
+        echo "Detected prefix: $PREFIX"
+
+        if [ "${{ inputs.RECOVERY_TYPE }}" = "pbrp" ]; then
+          lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka pbrp
+        elif [ "${{ inputs.RECOVERY_TYPE }}" = "ofrp" ]; then
+          if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ] && [ "${{ inputs.BUILD_TARGET }}" = "boot" ]; then
+            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka adbd bootimage
+          elif [ "${{ inputs.IS_AB_DEVICE }}" = "true" ] && [ "${{ inputs.BUILD_TARGET }}" = "vendorboot" ]; then
+            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka adbd vendorbootimage
+          else
+            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka adbd recoveryimage
+          fi
+        else
+          lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka recoveryimage
+        fi
 
     - name: Verify output
       run: |
@@ -254,7 +375,7 @@ jobs:
         F=${{ inputs.BUILD_TARGET == 'vendorboot' && 'vendor_boot.img' || format('{0}.img', inputs.BUILD_TARGET) }}
         [ -s "$F" ] || { echo "Missing/empty: $F"; exit 1; }
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v5 # Обновлено до v5
       if: failure()
       with:
         name: log-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
@@ -263,36 +384,41 @@ jobs:
           android-recovery/out/verbose.log
         retention-days: 7
 
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v5 # Обновлено до v5
       with:
-        name: PBRP-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
+        name: ${{ inputs.RECOVERY_TYPE }}-${{ inputs.DEVICE_NAME }}-${{ github.run_id }}
         path: |
           android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/*.img
-          android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/PBRP*.zip
+          android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/*.zip
         retention-days: 3
 
     - uses: softprops/action-gh-release@v2
       with:
         files: |
           android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/${{ inputs.BUILD_TARGET == 'vendorboot' && 'vendor_boot.img' || format('{0}.img', inputs.BUILD_TARGET) }}
-          android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/PBRP*.zip
-        name: PBRP ${{ inputs.DEVICE_NAME }} // ${{ env.BUILD_DATE }}
-        tag_name: pbrp-${{ inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}-${{ github.run_id }}
+          android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}/*.zip
+        name: ${{ inputs.RECOVERY_TYPE }} ${{ inputs.DEVICE_NAME }} // A${{ inputs.ANDROID_VERSION }} // ${{ env.BUILD_DATE }}
+        tag_name: ${{ inputs.RECOVERY_TYPE }}-${{ inputs.DEVICE_NAME }}-${{ env.BUILD_DATE }}-${{ github.run_id }}
         fail_on_unmatched_files: false
         body: |
+          Recovery: ${{ inputs.RECOVERY_TYPE }}
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
-          Tree: ${{ inputs.USE_TWRPDTGEN == 'true' && 'twrpdtgen' || 'Manual' }}
+          Generator: ${{ inputs.TREE_GENERATOR }}
+          Android: ${{ inputs.ANDROID_VERSION }}
+          Source: ${{ env.COMMIT_ID }}
 
     - name: Summary
       if: always()
       run: |
         {
-          echo "### PBRP Build"
+          echo "### Recovery Build"
           echo "| Field | Value |"
           echo "| --- | --- |"
+          echo "| Recovery | ${{ inputs.RECOVERY_TYPE }} |"
           echo "| Device | ${{ inputs.DEVICE_NAME }} |"
           echo "| Manifest | ${{ inputs.MANIFEST_BRANCH }} |"
+          echo "| Generator | ${{ inputs.TREE_GENERATOR }} |"
+          echo "| Android | ${{ inputs.ANDROID_VERSION }} |"
           echo "| Target | ${{ inputs.BUILD_TARGET }} |"
-          echo "| A/B | ${{ inputs.IS_AB_DEVICE }} |"
           echo "| Status | ${{ job.status }} |"
         } >> $GITHUB_STEP_SUMMARY
