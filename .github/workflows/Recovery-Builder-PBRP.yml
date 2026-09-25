@@ -130,10 +130,20 @@ jobs:
 
     - name: Fixed Missing Fonts
       run: |
-        cd android-recovery
-        cd external/noto-fonts/other
-        wget https://github.com/cd-Crypton/custom-recovery-extras/raw/main/missing-font.zip
-        unzip -o missing-font.zip
+        
+          cd android_recovery
+          if [ -d "external/noto-fonts/other" ]; then
+              cd external/noto-fonts/other
+          elif [ -d "external/noto-fonts/others" ]; then
+              cd external/noto-fonts/others
+          else
+              mkdir -p external/noto-fonts/other
+              cd external/noto-fonts/other
+          fi
+          
+          wget https://github.com
+          unzip -o missing-font.zip
+          
 
     - name: Building Image
       run: |
