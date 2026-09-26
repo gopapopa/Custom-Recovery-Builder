@@ -296,33 +296,125 @@ jobs:
         cat AndroidProducts.mk
 
     # ============================================================
+    # AUTO-RESOLVE MISSING DEPENDENCIES
+    # ============================================================
+    - name: Auto-resolve missing dependencies
+      run: |
+        cd android-recovery/${{ inputs.DEVICE_PATH }}
+
+        # --- 0. Определяем ветку LineageOS под целевую версию Android ---
+        case "${{ inputs.ANDROID_VERSION }}" in
+          16) LOS_BRANCH="lineage-23.0" ;;
+          15) LOS_BRANCH="lineage-22.0" ;;
+          14) LOS_BRANCH="lineage-21.0" ;;
+          13) LOS_BRANCH="lineage-20.0" ;;
+          12) LOS_BRANCH="lineage-19.1" ;;
+          11) LOS_BRANCH="lineage-18.1" ;;
+          10) LOS_BRANCH="lineage-17.1" ;;
+          9)  LOS_BRANCH="lineage-16.0" ;;
+          *)  LOS_BRANCH="lineage-19.1" ;;
+        esac
+        echo "Using LineageOS branch for auto-clone: $LOS_BRANCH"
+
+        # --- 1. Если есть файл зависимостей — парсим его ---
+        DEP_FILE=""
+        [ -f "lineage.dependencies" ] && DEP_FILE="lineage.dependencies"
+        [ -f "twrp.dependencies" ] && DEP_FILE="twrp.dependencies"
+
+        if [ -n "$DEP_FILE" ]; then
+          echo "Found $DEP_FILE — cloning all listed dependencies..."
+          export DEP_FILE
+          python3 - <<'PYEOF'
+        import json, subprocess, os
+        dep_file = os.environ["DEP_FILE"]
+        los_branch = os.environ.get("LOS_BRANCH", "lineage-19.1")
+        with open(dep_file) as f:
+            deps = json.load(f)
+        for d in deps:
+            repo = d.get("repository")
+            path = d.get("target_path")
+            branch = d.get("branch", los_branch)
+            if not repo or not path:
+                continue
+            if os.path.isdir(path):
+                print(f"  [skip] {path} already exists")
+                continue
+            url = f"https://github.com/{repo}.git"
+            print(f"  [clone] {url} -> {path} ({branch})")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            subprocess.run(
+                ["git", "clone", "--depth=1", "-b", branch, url, path],
+                check=False
+            )
+        PYEOF
+          # Возвращаемся в корень android-recovery после клонирования
+          cd android-recovery
+          cd ${{ inputs.DEVICE_PATH }}
+        fi
+
+        # --- 2. Эвристика: ищем hardware/qcom-caf/... в .mk файлах ---
+        echo "Scanning .mk files for missing hardware paths..."
+        MISSING_PATHS=$(grep -rhoE 'hardware/qcom-caf/[a-zA-Z0-9_-]+' \
+          --include='*.mk' . 2>/dev/null | sort -u || true)
+
+        if [ -n "$MISSING_PATHS" ]; then
+          echo "Found references:"
+          echo "$MISSING_PATHS"
+          for rel_path in $MISSING_PATHS; do
+            FULL="../../$rel_path"
+            if [ -d "$FULL" ]; then
+              echo "  [skip] $rel_path already exists"
+              continue
+            fi
+
+            if [ "$rel_path" = "hardware/qcom-caf/common" ]; then
+              URL="https://github.com/LineageOS/android_hardware_qcom-caf_common.git"
+              BRANCH="$LOS_BRANCH"
+            else
+              PLATFORM=$(basename "$rel_path")
+              URL="https://github.com/LineageOS/android_hardware_qcom-caf_${PLATFORM}.git"
+              BRANCH="$LOS_BRANCH"
+              echo "  [guess] trying $URL ($BRANCH)"
+            fi
+
+            mkdir -p "$(dirname $FULL)"
+            if git clone --depth=1 -b "$BRANCH" "$URL" "$FULL" 2>/dev/null; then
+              echo "  [ok] cloned $rel_path"
+            else
+              echo "  [fail] could not clone $rel_path — add manually if needed"
+            fi
+          done
+        else
+          echo "No hardware/qcom-caf references found in .mk files."
+        fi
+
+        echo "=== Dependency resolution done ==="
+
+    # ============================================================
     # PATCH BOARD CONFIG
     # ============================================================
     - name: Patch BoardConfig.mk
       env: { FLAGS: '${{ inputs.EXTRA_BUILD_FLAGS }}' }
       run: |
         cd android-recovery/${{ inputs.DEVICE_PATH }}
-        {
-          echo "# --- Injected ---"
-          echo "PLATFORM_VERSION := ${{ inputs.ANDROID_VERSION }}"
-          echo "ALLOW_MISSING_DEPENDENCIES := true"
+        printf '\n# --- Injected ---\n' >> BoardConfig.mk
+        printf 'PLATFORM_VERSION := %s\n' "${{ inputs.ANDROID_VERSION }}" >> BoardConfig.mk
+        printf 'ALLOW_MISSING_DEPENDENCIES := true\n' >> BoardConfig.mk
 
-          if [ -n "${{ inputs.SCREEN_RESOLUTION }}" ]; then
-            echo "TARGET_SCREEN_WIDTH := $(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f1)"
-            echo "TARGET_SCREEN_HEIGHT := $(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f2)"
-          fi
+        if [ -n "${{ inputs.SCREEN_RESOLUTION }}" ]; then
+          printf 'TARGET_SCREEN_WIDTH := %s\n'  "$(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f1)" >> BoardConfig.mk
+          printf 'TARGET_SCREEN_HEIGHT := %s\n' "$(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f2)" >> BoardConfig.mk
+        fi
 
-          if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
-            echo "BOARD_BUILD_SYSTEMROOT_IMAGE := true"
-            echo "AB_OTA_UPDATER := true"
-          fi
+        if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
+          printf 'BOARD_BUILD_SYSTEMROOT_IMAGE := true\n' >> BoardConfig.mk
+          printf 'AB_OTA_UPDATER := true\n' >> BoardConfig.mk
+        fi
 
-          if [ -n "$FLAGS" ]; then
-            printf '%s\n' "$FLAGS"
-          fi
+        if [ -n "$FLAGS" ]; then
+          printf '%s\n' "$FLAGS" >> BoardConfig.mk
+        fi
 
-          true
-        } >> BoardConfig.mk
         echo "=== BoardConfig.mk patched ==="
         tail -n 20 BoardConfig.mk
 
