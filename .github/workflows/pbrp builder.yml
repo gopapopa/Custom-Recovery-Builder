@@ -379,7 +379,7 @@ jobs:
     - name: Auto-resolve missing dependencies
       run: |
         set +e
-        cd android-recovery/${{ inputs.DEVICE_PATH }} || exit 1
+        cd android-recovery || exit 1
 
         case "${{ inputs.ANDROID_VERSION }}" in
           16) LOS_BRANCH="lineage-23.0"; ALT_BRANCHES="lineage-22.2 lineage-22.1 lineage-22.0" ;;
@@ -402,7 +402,10 @@ jobs:
 
         DEP_FILE=""
         for f in lineage.dependencies twrp.dependencies omni.dependencies pbrp.dependencies; do
-          [ -f "$f" ] && DEP_FILE="$f" && break
+          if [ -f "${{ inputs.DEVICE_PATH }}/$f" ]; then
+            DEP_FILE="${{ inputs.DEVICE_PATH }}/$f"
+            break
+          fi
         done
 
         if [ -n "$DEP_FILE" ]; then
@@ -447,19 +450,17 @@ jobs:
             '    try_clone(repo, path, branch)' \
             > /tmp/resolve_deps.py
           python3 /tmp/resolve_deps.py
-          cd android-recovery 2>/dev/null || true
-          cd ${{ inputs.DEVICE_PATH }} 2>/dev/null || true
         fi
 
         echo "Scanning .mk files for missing hardware paths..."
         MISSING_PATHS=$(grep -rhoE 'hardware/qcom-caf/[a-zA-Z0-9_-]+' \
-          --include='*.mk' . 2>/dev/null | sort -u || true)
+          --include='*.mk' "${{ inputs.DEVICE_PATH }}" 2>/dev/null | sort -u || true)
 
         if [ -n "$MISSING_PATHS" ]; then
           echo "Found references:"
           echo "$MISSING_PATHS"
           for rel_path in $MISSING_PATHS; do
-            FULL="../../$rel_path"
+            FULL="$rel_path"
             if [ -d "$FULL" ] && [ -n "$(ls -A $FULL 2>/dev/null)" ]; then
               echo "  [skip] $rel_path already exists"
               continue
@@ -493,7 +494,7 @@ jobs:
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-18.1/target/product/non_ab_device.mk"
         )
 
-        TARGET_DIR="../../build/make/target/product"
+        TARGET_DIR="build/make/target/product"
         if [ ! -f "$TARGET_DIR/non_ab_device.mk" ]; then
           echo "Downloading real non_ab_device.mk from LineageOS..."
           mkdir -p "$TARGET_DIR" || true
@@ -540,8 +541,6 @@ jobs:
           fi
         fi
 
-        cd ../../ || true
-
         if [ ! -d "hardware/samsung" ] || [ -z "$(ls -A hardware/samsung 2>/dev/null)" ]; then
           echo "Cloning hardware/samsung from LineageOS..."
           rm -rf hardware/samsung 2>/dev/null || true
@@ -562,28 +561,83 @@ jobs:
           echo "hardware/samsung already exists"
         fi
 
+        # --- kernel/samsung/sdm429 ---
         if [ ! -d "kernel/samsung/sdm429" ] || [ -z "$(ls -A kernel/samsung/sdm429 2>/dev/null)" ]; then
-          echo "Cloning kernel/samsung/sdm429 from LineageOS..."
+          echo "Cloning kernel/samsung/sdm429..."
+
+          if [ "${{ inputs.DEVICE_NAME }}" = "gtowifi" ]; then
+            KERNEL_URL="https://github.com/lifehacker-101/android_kernel_samsung_sdm429.git"
+            KERNEL_BRANCH="lineage-18.1"
+            echo "  [gtowifi] using alternative kernel: $KERNEL_URL ($KERNEL_BRANCH)"
+          else
+            KERNEL_URL="https://github.com/LineageOS/android_kernel_samsung_sdm429.git"
+            KERNEL_BRANCH="$LOS_BRANCH"
+            echo "  [generic] using LineageOS kernel: $KERNEL_URL ($KERNEL_BRANCH)"
+          fi
+
           mkdir -p kernel/samsung || true
           rm -rf kernel/samsung/sdm429 2>/dev/null || true
-          for b in "$LOS_BRANCH" $ALT_BRANCHES; do
-            if git clone --depth=1 -b "$b" \
-              https://github.com/LineageOS/android_kernel_samsung_sdm429.git \
-              kernel/samsung/sdm429 2>/dev/null; then
+
+          CLONED=0
+          for b in "$KERNEL_BRANCH" $ALT_BRANCHES; do
+            if git clone --depth=1 -b "$b" "$KERNEL_URL" kernel/samsung/sdm429 2>/dev/null; then
               echo "  [ok] kernel/samsung/sdm429 ($b)"
+              CLONED=1
               break
             fi
             rm -rf kernel/samsung/sdm429 2>/dev/null || true
           done
-          if [ ! -d "kernel/samsung/sdm429" ] || [ -z "$(ls -A kernel/samsung/sdm429 2>/dev/null)" ]; then
-            echo "ERROR: failed to clone kernel/samsung/sdm429"
-            exit 1
+
+          if [ "$CLONED" = "0" ]; then
+            echo "  [fail] could not clone kernel source"
+            echo "  Searching for prebuilt kernel in device tree..."
+
+            PREBUILT=""
+            for cand in \
+              "prebuilt/Image.gz-dtb" \
+              "prebuilt/Image.gz" \
+              "prebuilt/Image" \
+              "prebuilt/kernel" \
+              "Image.gz-dtb" \
+              "Image.gz" \
+              "Image" \
+              "kernel" \
+              "zImage" \
+              "zImage-dtb"; do
+              if [ -f "${{ inputs.DEVICE_PATH }}/$cand" ]; then
+                PREBUILT="$cand"
+                echo "  [ok] found prebuilt kernel: $cand ($(stat -c%s "${{ inputs.DEVICE_PATH }}/$cand") bytes)"
+                break
+              fi
+            done
+
+            if [ -z "$PREBUILT" ]; then
+              PREBUILT=$(find "${{ inputs.DEVICE_PATH }}" -maxdepth 3 -type f \
+                \( -name "Image.gz-dtb" -o -name "Image.gz" -o -name "Image" \
+                   -o -name "zImage" -o -name "zImage-dtb" -o -name "kernel" \) \
+                2>/dev/null | head -1 || true)
+              if [ -n "$PREBUILT" ]; then
+                PREBUILT=${PREBUILT#${{ inputs.DEVICE_PATH }}/}
+                echo "  [ok] found prebuilt kernel: $PREBUILT"
+              fi
+            fi
+
+            if [ -n "$PREBUILT" ]; then
+              echo "  [info] using prebuilt kernel from device tree: $PREBUILT"
+              {
+                printf '\n# --- Prebuilt kernel (auto-injected) ---\n'
+                printf 'TARGET_PREBUILT_KERNEL := %s/%s\n' "${{ inputs.DEVICE_PATH }}" "$PREBUILT"
+                printf 'BOARD_KERNEL_IMAGE_NAME := %s\n' "$(basename "$PREBUILT")"
+              } >> "${{ inputs.DEVICE_PATH }}/BoardConfig.mk" || true
+              echo "  [ok] BoardConfig.mk patched to use prebuilt kernel"
+            else
+              echo "  [warn] no prebuilt kernel found in device tree"
+              echo "  [warn] build may fail if kernel is required"
+            fi
           fi
         else
           echo "kernel/samsung/sdm429 already exists"
         fi
-
-        cd ${{ inputs.DEVICE_PATH }} 2>/dev/null || true
 
         echo "=== Dependency resolution done (real files, not stubs) ==="
 
