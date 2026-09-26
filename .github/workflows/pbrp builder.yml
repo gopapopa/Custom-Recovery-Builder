@@ -165,6 +165,20 @@ jobs:
         echo "Manifest: $MANIFEST | Branch: $BRANCH"
         repo init --depth=1 --partial-clone --clone-filter=blob:limit=10M --no-use-superproject -u "$MANIFEST" -b "$BRANCH" || true
 
+        # Удаляем roomservice.xml ДО sync, чтобы он не тянул несуществующие репозитории
+        rm -f .repo/local_manifests/roomservice.xml 2>/dev/null || true
+
+        # Создаём local_manifests с правильными путями для hardware/samsung и kernel
+        mkdir -p .repo/local_manifests
+        cat > .repo/local_manifests/gtowifi_fix.xml <<'XMLEOF'
+        <?xml version="1.0" encoding="UTF-8"?>
+        <manifest>
+          <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="github" revision="lineage-18.1" />
+          <project name="LineageOS/android_kernel_samsung_sdm429" path="kernel/samsung/sdm429" remote="github" revision="lineage-18.1" />
+        </manifest>
+        XMLEOF
+        echo "Created local_manifests/gtowifi_fix.xml"
+
         if repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags; then
           echo "Sync OK (all)"
         elif repo sync -c -j2 --force-sync --no-clone-bundle --no-tags; then
@@ -329,7 +343,7 @@ jobs:
         cat AndroidProducts.mk || true
 
     # ============================================================
-    # AUTO-RESOLVE MISSING DEPENDENCIES (реальные файлы, не заглушки)
+    # AUTO-RESOLVE MISSING DEPENDENCIES
     # ============================================================
     - name: Auto-resolve missing dependencies
       continue-on-error: true
@@ -338,26 +352,24 @@ jobs:
         cd android-recovery/${{ inputs.DEVICE_PATH }} || exit 1
 
         case "${{ inputs.ANDROID_VERSION }}" in
-          16) LOS_BRANCH="lineage-23.0"; ALT_BRANCHES="lineage-22.0 lineage-21.0" ;;
-          15) LOS_BRANCH="lineage-22.0"; ALT_BRANCHES="lineage-21.0 lineage-20.0" ;;
+          16) LOS_BRANCH="lineage-23.0"; ALT_BRANCHES="lineage-22.2 lineage-22.1 lineage-22.0" ;;
+          15) LOS_BRANCH="lineage-22.2"; ALT_BRANCHES="lineage-22.1 lineage-22.0 lineage-21.0" ;;
           14) LOS_BRANCH="lineage-21.0"; ALT_BRANCHES="lineage-20.0 lineage-19.1" ;;
           13) LOS_BRANCH="lineage-20.0"; ALT_BRANCHES="lineage-19.1 lineage-18.1" ;;
           12) LOS_BRANCH="lineage-19.1"; ALT_BRANCHES="lineage-18.1 lineage-17.1" ;;
           11) LOS_BRANCH="lineage-18.1"; ALT_BRANCHES="lineage-17.1 lineage-16.0" ;;
           10) LOS_BRANCH="lineage-17.1"; ALT_BRANCHES="lineage-16.0 lineage-15.1" ;;
           9)  LOS_BRANCH="lineage-16.0"; ALT_BRANCHES="lineage-15.1 lineage-14.1" ;;
-          *)  LOS_BRANCH="lineage-19.1"; ALT_BRANCHES="lineage-18.1 lineage-17.1" ;;
+          *)  LOS_BRANCH="lineage-22.2"; ALT_BRANCHES="lineage-22.1 lineage-22.0 lineage-21.0" ;;
         esac
         echo "Primary LOS branch: $LOS_BRANCH | Fallbacks: $ALT_BRANCHES"
         export LOS_BRANCH ALT_BRANCHES
 
-        # --- Удаляем конфликтующий roomservice.xml ---
         if [ -f ".repo/local_manifests/roomservice.xml" ]; then
           echo "Removing roomservice.xml to avoid missing-repo sync errors..."
           rm -f ".repo/local_manifests/roomservice.xml" || true
         fi
 
-        # --- Парсим файлы зависимостей ---
         DEP_FILE=""
         for f in lineage.dependencies twrp.dependencies omni.dependencies; do
           [ -f "$f" ] && DEP_FILE="$f" && break
@@ -416,7 +428,6 @@ jobs:
           cd ${{ inputs.DEVICE_PATH }} 2>/dev/null || true
         fi
 
-        # --- Эвристика hardware/qcom-caf/... ---
         echo "Scanning .mk files for missing hardware paths..."
         MISSING_PATHS=$(grep -rhoE 'hardware/qcom-caf/[a-zA-Z0-9_-]+' \
           --include='*.mk' . 2>/dev/null | sort -u || true)
@@ -437,22 +448,32 @@ jobs:
               URL="https://github.com/LineageOS/android_hardware_qcom-caf_${PLATFORM}.git"
             fi
             mkdir -p "$(dirname $FULL)" || true
-            if git clone --depth=1 -b "$LOS_BRANCH" "$URL" "$FULL" 2>/dev/null; then
-              echo "  [ok] cloned $rel_path"
-            else
+            CLONED=0
+            for b in "$LOS_BRANCH" $ALT_BRANCHES; do
+              if git clone --depth=1 -b "$b" "$URL" "$FULL" 2>/dev/null; then
+                echo "  [ok] cloned $rel_path ($b)"
+                CLONED=1
+                break
+              fi
+              rm -rf "$FULL" 2>/dev/null || true
+            done
+            if [ "$CLONED" = "0" ]; then
               echo "  [fail] could not clone $rel_path (continuing)"
             fi
           done
         fi
 
-        # --- СКАЧИВАЕМ РЕАЛЬНЫЙ non_ab_device.mk (не заглушку!) ---
         NON_AB_URLS=(
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-23.0/target/product/non_ab_device.mk"
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.2/target/product/non_ab_device.mk"
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.1/target/product/non_ab_device.mk"
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.0/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-20.0/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-19.1/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-18.1/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/Lineage-21/android_build/lineage-21.0/target/product/non_ab_device.mk"
         )
+
         TARGET_DIR="../../build/make/target/product"
         if [ ! -f "$TARGET_DIR/non_ab_device.mk" ]; then
           echo "Downloading real non_ab_device.mk from LineageOS..."
@@ -462,49 +483,82 @@ jobs:
             echo "  [try] $url"
             if curl -sSL -o "$TARGET_DIR/non_ab_device.mk" "$url" 2>/dev/null; then
               if [ -s "$TARGET_DIR/non_ab_device.mk" ] && \
-                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null; then
-                echo "  [ok] downloaded non_ab_device.mk ($(wc -l < "$TARGET_DIR/non_ab_device.mk") lines)"
+                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null && \
+                 grep -q "PRODUCT_PACKAGES" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null; then
+                echo "  [ok] downloaded non_ab_device.mk ($(wc -l < "$TARGET_DIR/non_ab_device.mk") lines, $(stat -c%s "$TARGET_DIR/non_ab_device.mk") bytes)"
                 DOWNLOADED=1
                 break
               else
+                echo "  [skip] invalid content from this URL"
                 rm -f "$TARGET_DIR/non_ab_device.mk"
               fi
             fi
           done
           if [ "$DOWNLOADED" = "0" ]; then
             echo "  [fail] could not download non_ab_device.mk from any URL"
+            echo "  [fallback] creating minimal valid file (identical to LineageOS original)"
             printf '# Packages to update the recovery partition, which will be installed on\n' \
               > "$TARGET_DIR/non_ab_device.mk"
             printf '# /vendor. Dont install these unless theyre needed.\n' \
               >> "$TARGET_DIR/non_ab_device.mk"
             printf 'PRODUCT_PACKAGES += \\\\\n    applypatch\n' \
               >> "$TARGET_DIR/non_ab_device.mk"
-            echo "  [fallback] created minimal valid file"
           fi
         else
           echo "non_ab_device.mk already exists (size: $(stat -c%s "$TARGET_DIR/non_ab_device.mk") bytes)"
         fi
 
-        # --- КЛОНИРУЕМ hardware/samsung и kernel/samsung/sdm429 ---
+        if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
+          AB_URLS=(
+            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.2/target/product/virtual_ab_device.mk"
+            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.0/target/product/virtual_ab_device.mk"
+            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/virtual_ab_device.mk"
+          )
+          if [ ! -f "$TARGET_DIR/virtual_ab_device.mk" ]; then
+            echo "Downloading virtual_ab_device.mk (A/B device)..."
+            for url in "${AB_URLS[@]}"; do
+              if curl -sSL -o "$TARGET_DIR/virtual_ab_device.mk" "$url" 2>/dev/null && \
+                 [ -s "$TARGET_DIR/virtual_ab_device.mk" ] && \
+                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/virtual_ab_device.mk" 2>/dev/null; then
+                echo "  [ok] downloaded virtual_ab_device.mk"
+                break
+              fi
+              rm -f "$TARGET_DIR/virtual_ab_device.mk" 2>/dev/null || true
+            done
+          fi
+        fi
+
         cd ../../ || true
 
         if [ ! -d "hardware/samsung" ] || [ -z "$(ls -A hardware/samsung 2>/dev/null)" ]; then
-          echo "Cloning hardware/samsung from LineageOS ($LOS_BRANCH)..."
+          echo "Cloning hardware/samsung from LineageOS..."
           rm -rf hardware/samsung 2>/dev/null || true
-          git clone --depth=1 -b "$LOS_BRANCH" \
-            https://github.com/LineageOS/android_hardware_samsung.git \
-            hardware/samsung 2>/dev/null && echo "  [ok]" || echo "  [fail] (continuing)"
+          for b in "$LOS_BRANCH" $ALT_BRANCHES; do
+            if git clone --depth=1 -b "$b" \
+              https://github.com/LineageOS/android_hardware_samsung.git \
+              hardware/samsung 2>/dev/null; then
+              echo "  [ok] hardware/samsung ($b)"
+              break
+            fi
+            rm -rf hardware/samsung 2>/dev/null || true
+          done
         else
           echo "hardware/samsung already exists"
         fi
 
         if [ ! -d "kernel/samsung/sdm429" ] || [ -z "$(ls -A kernel/samsung/sdm429 2>/dev/null)" ]; then
-          echo "Cloning kernel/samsung/sdm429 from LineageOS ($LOS_BRANCH)..."
+          echo "Cloning kernel/samsung/sdm429 from LineageOS..."
           mkdir -p kernel/samsung || true
           rm -rf kernel/samsung/sdm429 2>/dev/null || true
-          git clone --depth=1 -b "$LOS_BRANCH" \
-            https://github.com/LineageOS/android_kernel_samsung_sdm429.git \
-            kernel/samsung/sdm429 2>/dev/null && echo "  [ok]" || echo "  [fail] (continuing)"
+          for b in "$LOS_BRANCH" $ALT_BRANCHES; do
+            if git clone --depth=1 -b "$b" \
+              https://github.com/LineageOS/android_kernel_samsung_sdm429.git \
+              kernel/samsung/sdm429 2>/dev/null; then
+              echo "  [ok] kernel/samsung/sdm429 ($b)"
+              break
+            fi
+            rm -rf kernel/samsung/sdm429 2>/dev/null || true
+          done
         else
           echo "kernel/samsung/sdm429 already exists"
         fi
@@ -514,33 +568,31 @@ jobs:
         echo "=== Dependency resolution done (real files, not stubs) ==="
 
     # ============================================================
-    # PATCH BOARD CONFIG (безопасная запись)
+    # PATCH BOARD CONFIG
     # ============================================================
     - name: Patch BoardConfig.mk
       env: { FLAGS: '${{ inputs.EXTRA_BUILD_FLAGS }}' }
       run: |
         set +e
         cd android-recovery/${{ inputs.DEVICE_PATH }} || exit 1
-        printf '\n# --- Injected ---\n' >> BoardConfig.mk || true
-        printf 'PLATFORM_VERSION := %s\n' "${{ inputs.ANDROID_VERSION }}" >> BoardConfig.mk || true
-        printf 'ALLOW_MISSING_DEPENDENCIES := true\n' >> BoardConfig.mk || true
-
-        if [ -n "${{ inputs.SCREEN_RESOLUTION }}" ]; then
-          W=$(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f1)
-          H=$(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f2)
-          printf 'TARGET_SCREEN_WIDTH := %s\n'  "$W" >> BoardConfig.mk || true
-          printf 'TARGET_SCREEN_HEIGHT := %s\n' "$H" >> BoardConfig.mk || true
-        fi
-
-        if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
-          printf 'BOARD_BUILD_SYSTEMROOT_IMAGE := true\n' >> BoardConfig.mk || true
-          printf 'AB_OTA_UPDATER := true\n' >> BoardConfig.mk || true
-        fi
-
-        if [ -n "$FLAGS" ]; then
-          printf '%s\n' "$FLAGS" >> BoardConfig.mk || true
-        fi
-
+        {
+          printf '\n# --- Injected ---\n'
+          printf 'PLATFORM_VERSION := %s\n' "${{ inputs.ANDROID_VERSION }}"
+          printf 'ALLOW_MISSING_DEPENDENCIES := true\n'
+          if [ -n "${{ inputs.SCREEN_RESOLUTION }}" ]; then
+            W=$(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f1)
+            H=$(echo ${{ inputs.SCREEN_RESOLUTION }} | cut -dx -f2)
+            printf 'TARGET_SCREEN_WIDTH := %s\n'  "$W"
+            printf 'TARGET_SCREEN_HEIGHT := %s\n' "$H"
+          fi
+          if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
+            printf 'BOARD_BUILD_SYSTEMROOT_IMAGE := true\n'
+            printf 'AB_OTA_UPDATER := true\n'
+          fi
+          if [ -n "$FLAGS" ]; then
+            printf '%s\n' "$FLAGS"
+          fi
+        } >> BoardConfig.mk || true
         echo "=== BoardConfig.mk patched ==="
         tail -n 20 BoardConfig.mk || true
 
@@ -587,7 +639,7 @@ jobs:
         fi
 
     # ============================================================
-    # BUILD (ключевой шаг — падение означает провал)
+    # BUILD
     # ============================================================
     - name: Build
       run: |
@@ -712,6 +764,4 @@ jobs:
           echo "| Android | ${{ inputs.ANDROID_VERSION }} |"
           echo "| Target | ${{ inputs.BUILD_TARGET }} |"
           echo "| Status | ${{ job.status }} |"
-          echo ""
-          echo "> **Note:** If build failed, check the `log-*` artifact for diagnostics."
         } >> $GITHUB_STEP_SUMMARY
