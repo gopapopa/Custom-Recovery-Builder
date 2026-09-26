@@ -6,7 +6,7 @@ on:
       RECOVERY_TYPE:
         description: 'Recovery Type'
         required: true
-        default: 'twrp'
+        default: 'pbrp'
         type: choice
         options: [twrp, pbrp, shrp, ofrp]
       MANIFEST_BRANCH:
@@ -97,7 +97,7 @@ jobs:
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OUT: android-recovery/out/target/product/${{ inputs.DEVICE_NAME }}
-      BUILD_DATE: ${{ github.run_number }}
+      BUILD_DATE: ${{ github.run_id }}
       SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@v5
@@ -132,6 +132,9 @@ jobs:
         distribution: zulu
         java-version: ${{ (inputs.ANDROID_VERSION == '14' || inputs.ANDROID_VERSION == '15' || inputs.ANDROID_VERSION == '16') && '17' || '11' }}
 
+    # ============================================================
+    # INIT + SYNC (repo-based: TWRP / PBRP / SHRP)
+    # ============================================================
     - name: Init + sync (repo-based)
       if: inputs.RECOVERY_TYPE != 'ofrp'
       run: |
@@ -160,17 +163,29 @@ jobs:
         esac
 
         echo "Manifest: $MANIFEST | Branch: $BRANCH"
-        repo init --depth=1 --no-use-superproject -u "$MANIFEST" -b "$BRANCH" || true
+        repo init --depth=1 --no-use-superproject --no-clone-bundle -u "$MANIFEST" -b "$BRANCH" || true
 
-        rm -f .repo/local_manifests/roomservice.xml 2>/dev/null || true
         mkdir -p .repo/local_manifests
-        printf '%s\n' \
-          '<?xml version="1.0" encoding="UTF-8"?>' \
-          '<manifest>' \
-          '  <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="github" revision="lineage-18.1" />' \
-          '  <project name="LineageOS/android_kernel_samsung_sdm429" path="kernel/samsung/sdm429" remote="github" revision="lineage-18.1" />' \
-          '</manifest>' > .repo/local_manifests/gtowifi_fix.xml
-        echo "Created local_manifests/gtowifi_fix.xml"
+
+        if [ "${{ inputs.RECOVERY_TYPE }}" = "pbrp" ]; then
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<manifest></manifest>' \
+            > .repo/local_manifests/roomservice.xml
+          echo "Created empty roomservice.xml for PBRP"
+        else
+          rm -f .repo/local_manifests/roomservice.xml 2>/dev/null || true
+        fi
+
+        if [ "${{ inputs.RECOVERY_TYPE }}" != "pbrp" ]; then
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<manifest>' \
+            '  <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="github" revision="lineage-18.1" />' \
+            '  <project name="LineageOS/android_kernel_samsung_sdm429" path="kernel/samsung/sdm429" remote="github" revision="lineage-18.1" />' \
+            '</manifest>' > .repo/local_manifests/gtowifi_fix.xml
+          echo "Created gtowifi_fix.xml"
+        fi
 
         if repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags; then
           echo "Sync OK (all)"
@@ -183,6 +198,9 @@ jobs:
         fi
         [ -d ".repo" ] || { echo "Repo init failed completely"; exit 1; }
 
+    # ============================================================
+    # INIT + SYNC (OrangeFox)
+    # ============================================================
     - name: Init + sync (OrangeFox)
       if: inputs.RECOVERY_TYPE == 'ofrp'
       run: |
@@ -194,6 +212,9 @@ jobs:
         cd ../android-recovery || true
         echo "OrangeFox synced."
 
+    # ============================================================
+    # GENERATE TREE
+    # ============================================================
     - name: twrpdtgen → Generate tree
       if: inputs.TREE_GENERATOR == 'twrpdtgen'
       run: |
@@ -253,6 +274,10 @@ jobs:
       run: |
         set +e
         cd android-recovery
+        if [ -z "${{ inputs.DEVICE_TREE }}" ]; then
+          echo "ERROR: DEVICE_TREE is required for manual generator"
+          exit 1
+        fi
         mkdir -p $(dirname ${{ inputs.DEVICE_PATH }}) || true
         git clone ${{ inputs.DEVICE_TREE }} -b ${{ inputs.DEVICE_TREE_BRANCH }} \
           ${{ inputs.DEVICE_PATH }} || true
@@ -273,6 +298,9 @@ jobs:
         fi
         echo "Device tree verified: android-recovery/${{ inputs.DEVICE_PATH }}"
 
+    # ============================================================
+    # FIX DEVICE TREE
+    # ============================================================
     - name: Fix device tree
       run: |
         set +e
@@ -315,6 +343,18 @@ jobs:
           echo "WARNING: No product makefile found — continuing"
         fi
 
+        if [ "${{ inputs.RECOVERY_TYPE }}" = "pbrp" ] && [ ! -f "pbrp_${{ inputs.DEVICE_NAME }}.mk" ]; then
+          if [ -f "omni_${{ inputs.DEVICE_NAME }}.mk" ]; then
+            mv "omni_${{ inputs.DEVICE_NAME }}.mk" "pbrp_${{ inputs.DEVICE_NAME }}.mk"
+            sed -i "s/omni_${{ inputs.DEVICE_NAME }}/pbrp_${{ inputs.DEVICE_NAME }}/g" AndroidProducts.mk
+            echo "Renamed omni_* to pbrp_* for PBRP"
+          elif [ -f "twrp_${{ inputs.DEVICE_NAME }}.mk" ]; then
+            mv "twrp_${{ inputs.DEVICE_NAME }}.mk" "pbrp_${{ inputs.DEVICE_NAME }}.mk"
+            sed -i "s/twrp_${{ inputs.DEVICE_NAME }}/pbrp_${{ inputs.DEVICE_NAME }}/g" AndroidProducts.mk
+            echo "Renamed twrp_* to pbrp_* for PBRP"
+          fi
+        fi
+
         if [ -f "lineage.dependencies" ]; then
           mv "lineage.dependencies" "${PREFIX}.dependencies" 2>/dev/null || true
           echo "Renamed: lineage.dependencies -> ${PREFIX}.dependencies"
@@ -333,6 +373,9 @@ jobs:
         echo "=== Device tree fixed for ${{ inputs.RECOVERY_TYPE }} ==="
         cat AndroidProducts.mk || true
 
+    # ============================================================
+    # AUTO-RESOLVE MISSING DEPENDENCIES
+    # ============================================================
     - name: Auto-resolve missing dependencies
       run: |
         set +e
@@ -365,52 +408,45 @@ jobs:
         if [ -n "$DEP_FILE" ]; then
           echo "Found $DEP_FILE — resolving dependencies..."
           export DEP_FILE
-          python3 - <<'PYEOF'
-        import json, subprocess, os
-
-        dep_file = os.environ["DEP_FILE"]
-        los_branch = os.environ["LOS_BRANCH"]
-        alt_branches = os.environ.get("ALT_BRANCHES", "").split()
-
-        FALLBACK_ORGS = [None, "LineageOS", "TeamWin", "omnirom"]
-
-        def try_clone(repo, path, branch):
-            repo_name = repo.split("/")[-1]
-            branches_to_try = [branch] + alt_branches
-            for b in branches_to_try:
-                for org in FALLBACK_ORGS:
-                    if org is None:
-                        url = f"https://github.com/{repo}.git"
-                    else:
-                        url = f"https://github.com/{org}/{repo_name}.git"
-                    print(f"  [try] {url} -> {path} ({b})")
-                    os.makedirs(os.path.dirname(path), exist_ok=True)
-                    res = subprocess.run(
-                        ["git", "clone", "--depth=1", "-b", b, url, path],
-                        capture_output=True, text=True,
-                    )
-                    if res.returncode == 0:
-                        print(f"    [ok] cloned from {org or repo.split('/')[0]} ({b})")
-                        return True
-                    if os.path.isdir(path):
-                        subprocess.run(["rm", "-rf", path], check=False)
-            print(f"    [fail] could not clone {repo}")
-            return False
-
-        with open(dep_file) as f:
-            deps = json.load(f)
-
-        for d in deps:
-            repo = d.get("repository")
-            path = d.get("target_path")
-            branch = d.get("branch", los_branch)
-            if not repo or not path:
-                continue
-            if os.path.isdir(path) and os.listdir(path):
-                print(f"  [skip] {path} already exists")
-                continue
-            try_clone(repo, path, branch)
-        PYEOF
+          printf '%s\n' \
+            'import json, subprocess, os' \
+            'dep_file = os.environ["DEP_FILE"]' \
+            'los_branch = os.environ["LOS_BRANCH"]' \
+            'alt_branches = os.environ.get("ALT_BRANCHES", "").split()' \
+            'FALLBACK_ORGS = [None, "LineageOS", "TeamWin", "omnirom"]' \
+            'def try_clone(repo, path, branch):' \
+            '    repo_name = repo.split("/")[-1]' \
+            '    branches_to_try = [branch] + alt_branches' \
+            '    for b in branches_to_try:' \
+            '        for org in FALLBACK_ORGS:' \
+            '            if org is None:' \
+            '                url = f"https://github.com/{repo}.git"' \
+            '            else:' \
+            '                url = f"https://github.com/{org}/{repo_name}.git"' \
+            '            print(f"  [try] {url} -> {path} ({b})")' \
+            '            os.makedirs(os.path.dirname(path), exist_ok=True)' \
+            '            res = subprocess.run(["git", "clone", "--depth=1", "-b", b, url, path], capture_output=True, text=True)' \
+            '            if res.returncode == 0:' \
+            '                print(f"    [ok] cloned from {org or repo.split(chr(47))[0]} ({b})")' \
+            '                return True' \
+            '            if os.path.isdir(path):' \
+            '                subprocess.run(["rm", "-rf", path], check=False)' \
+            '    print(f"    [fail] could not clone {repo}")' \
+            '    return False' \
+            'with open(dep_file) as f:' \
+            '    deps = json.load(f)' \
+            'for d in deps:' \
+            '    repo = d.get("repository")' \
+            '    path = d.get("target_path")' \
+            '    branch = d.get("branch", los_branch)' \
+            '    if not repo or not path:' \
+            '        continue' \
+            '    if os.path.isdir(path) and os.listdir(path):' \
+            '        print(f"  [skip] {path} already exists")' \
+            '        continue' \
+            '    try_clone(repo, path, branch)' \
+            > /tmp/resolve_deps.py
+          python3 /tmp/resolve_deps.py
           cd android-recovery 2>/dev/null || true
           cd ${{ inputs.DEVICE_PATH }} 2>/dev/null || true
         fi
@@ -451,10 +487,6 @@ jobs:
         fi
 
         NON_AB_URLS=(
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-23.0/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.2/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.1/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.0/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-20.0/target/product/non_ab_device.mk"
           "https://raw.githubusercontent.com/LineageOS/android_build/lineage-19.1/target/product/non_ab_device.mk"
@@ -482,14 +514,8 @@ jobs:
             fi
           done
           if [ "$DOWNLOADED" = "0" ]; then
-            echo "  [fail] could not download non_ab_device.mk from any URL"
-            echo "  [fallback] creating minimal valid file (identical to LineageOS original)"
-            printf '# Packages to update the recovery partition, which will be installed on\n' \
-              > "$TARGET_DIR/non_ab_device.mk"
-            printf '# /vendor. Dont install these unless theyre needed.\n' \
-              >> "$TARGET_DIR/non_ab_device.mk"
-            printf 'PRODUCT_PACKAGES += \\\\\n    applypatch\n' \
-              >> "$TARGET_DIR/non_ab_device.mk"
+            echo "ERROR: could not download non_ab_device.mk from any URL"
+            exit 1
           fi
         else
           echo "non_ab_device.mk already exists (size: $(stat -c%s "$TARGET_DIR/non_ab_device.mk") bytes)"
@@ -497,20 +523,19 @@ jobs:
 
         if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
           AB_URLS=(
-            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.2/target/product/virtual_ab_device.mk"
-            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-22.0/target/product/virtual_ab_device.mk"
-            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/virtual_ab_device.mk"
+            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/virtual_ab_ota.mk"
+            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-20.0/target/product/virtual_ab_ota.mk"
           )
-          if [ ! -f "$TARGET_DIR/virtual_ab_device.mk" ]; then
-            echo "Downloading virtual_ab_device.mk (A/B device)..."
+          if [ ! -f "$TARGET_DIR/virtual_ab_ota.mk" ]; then
+            echo "Downloading virtual_ab_ota.mk (A/B device)..."
             for url in "${AB_URLS[@]}"; do
-              if curl -sSL -o "$TARGET_DIR/virtual_ab_device.mk" "$url" 2>/dev/null && \
-                 [ -s "$TARGET_DIR/virtual_ab_device.mk" ] && \
-                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/virtual_ab_device.mk" 2>/dev/null; then
-                echo "  [ok] downloaded virtual_ab_device.mk"
+              if curl -sSL -o "$TARGET_DIR/virtual_ab_ota.mk" "$url" 2>/dev/null && \
+                 [ -s "$TARGET_DIR/virtual_ab_ota.mk" ] && \
+                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/virtual_ab_ota.mk" 2>/dev/null; then
+                echo "  [ok] downloaded virtual_ab_ota.mk"
                 break
               fi
-              rm -f "$TARGET_DIR/virtual_ab_device.mk" 2>/dev/null || true
+              rm -f "$TARGET_DIR/virtual_ab_ota.mk" 2>/dev/null || true
             done
           fi
         fi
@@ -529,6 +554,10 @@ jobs:
             fi
             rm -rf hardware/samsung 2>/dev/null || true
           done
+          if [ ! -d "hardware/samsung" ] || [ -z "$(ls -A hardware/samsung 2>/dev/null)" ]; then
+            echo "ERROR: failed to clone hardware/samsung"
+            exit 1
+          fi
         else
           echo "hardware/samsung already exists"
         fi
@@ -546,6 +575,10 @@ jobs:
             fi
             rm -rf kernel/samsung/sdm429 2>/dev/null || true
           done
+          if [ ! -d "kernel/samsung/sdm429" ] || [ -z "$(ls -A kernel/samsung/sdm429 2>/dev/null)" ]; then
+            echo "ERROR: failed to clone kernel/samsung/sdm429"
+            exit 1
+          fi
         else
           echo "kernel/samsung/sdm429 already exists"
         fi
@@ -554,6 +587,9 @@ jobs:
 
         echo "=== Dependency resolution done (real files, not stubs) ==="
 
+    # ============================================================
+    # PATCH BOARD CONFIG
+    # ============================================================
     - name: Patch BoardConfig.mk
       env: { FLAGS: '${{ inputs.EXTRA_BUILD_FLAGS }}' }
       run: |
@@ -589,6 +625,10 @@ jobs:
           echo "ERROR: KERNEL_PATH is empty but KERNEL_TREE is set"
           exit 1
         fi
+        if [ -z "${{ inputs.KERNEL_BRANCH }}" ]; then
+          echo "ERROR: KERNEL_BRANCH is empty but KERNEL_TREE is set"
+          exit 1
+        fi
         mkdir -p $(dirname ${{ inputs.KERNEL_PATH }}) || true
         git clone ${{ inputs.KERNEL_TREE }} -b ${{ inputs.KERNEL_BRANCH }} \
           ${{ inputs.KERNEL_PATH }} --depth=1 || true
@@ -598,6 +638,9 @@ jobs:
           echo "Kernel clone failed — continuing"
         fi
 
+    # ============================================================
+    # SCCACHE
+    # ============================================================
     - name: Setup sccache
       if: inputs.ENABLE_SCCACHE
       uses: hendrikmuhs/ccache-action@v1.2.23
@@ -622,12 +665,16 @@ jobs:
           echo "sccache not found — continuing without ccache"
         fi
 
+    # ============================================================
+    # BUILD
+    # ============================================================
     - name: Build
       run: |
         set +e
         cd android-recovery || exit 1
         source build/envsetup.sh 2>/dev/null || true
         export ALLOW_MISSING_DEPENDENCIES=true
+        export LC_ALL="C"
         if [ "${{ inputs.ENABLE_SCCACHE }}" = "true" ]; then
           export USE_CCACHE=1
           export SCCACHE_DIR=$HOME/.cache/sccache
@@ -645,19 +692,19 @@ jobs:
         echo "Detected prefix: $PREFIX"
 
         if [ "${{ inputs.RECOVERY_TYPE }}" = "pbrp" ]; then
-          lunch pbrp_${{ inputs.DEVICE_NAME }}-eng && mka recoveryimage
+          lunch pbrp_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) recoveryimage
         elif [ "${{ inputs.RECOVERY_TYPE }}" = "shrp" ]; then
-          lunch omni_${{ inputs.DEVICE_NAME }}-eng && mka recoveryimage
+          lunch omni_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) recoveryimage
         elif [ "${{ inputs.RECOVERY_TYPE }}" = "ofrp" ]; then
           if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ] && [ "${{ inputs.BUILD_TARGET }}" = "boot" ]; then
-            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka adbd bootimage
+            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) adbd bootimage
           elif [ "${{ inputs.IS_AB_DEVICE }}" = "true" ] && [ "${{ inputs.BUILD_TARGET }}" = "vendorboot" ]; then
-            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka adbd vendorbootimage
+            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) adbd vendorbootimage
           else
-            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka adbd recoveryimage
+            lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) adbd recoveryimage
           fi
         else
-          lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka recoveryimage
+          lunch ${PREFIX}_${{ inputs.DEVICE_NAME }}-eng && mka -j$(nproc --all) recoveryimage
         fi
         BUILD_EXIT=$?
         echo "Build exited with code: $BUILD_EXIT"
@@ -680,6 +727,9 @@ jobs:
           exit 1
         fi
 
+    # ============================================================
+    # ДИАГНОСТИКА И АРТЕФАКТЫ
+    # ============================================================
     - name: Collect diagnostics
       if: failure()
       run: |
