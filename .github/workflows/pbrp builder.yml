@@ -9,6 +9,11 @@ on:
         default: 'pbrp'
         type: choice
         options: [twrp, pbrp, shrp, ofrp]
+      ALLOW_LINEAGE_DEPS:
+        description: 'Allow LineageOS dependencies (hardware/samsung, kernel, qcom-caf)'
+        required: true
+        type: boolean
+        default: false
       MANIFEST_BRANCH:
         description: 'Manifest Branch (version)'
         required: true
@@ -177,14 +182,17 @@ jobs:
           rm -f .repo/local_manifests/roomservice.xml 2>/dev/null || true
         fi
 
-        if [ "${{ inputs.RECOVERY_TYPE }}" != "pbrp" ]; then
+        if [ "${{ inputs.ALLOW_LINEAGE_DEPS }}" == "true" ]; then
           printf '%s\n' \
             '<?xml version="1.0" encoding="UTF-8"?>' \
             '<manifest>' \
             '  <project name="LineageOS/android_hardware_samsung" path="hardware/samsung" remote="github" revision="lineage-18.1" />' \
             '  <project name="LineageOS/android_kernel_samsung_sdm429" path="kernel/samsung/sdm429" remote="github" revision="lineage-18.1" />' \
-            '</manifest>' > .repo/local_manifests/gtowifi_fix.xml
-          echo "Created gtowifi_fix.xml"
+            '  <project name="LineageOS/android_hardware_qcom-caf_common" path="hardware/qcom-caf/common" remote="github" revision="lineage-18.1" />' \
+            '</manifest>' > .repo/local_manifests/lineage_deps.xml
+          echo "ALLOW_LINEAGE_DEPS=true — created lineage_deps.xml"
+        else
+          echo "ALLOW_LINEAGE_DEPS=false — device tree only, skipping LineageOS deps"
         fi
 
         if repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags; then
@@ -211,6 +219,36 @@ jobs:
           --path ${{ github.workspace }}/android-recovery || true
         cd ../android-recovery || true
         echo "OrangeFox synced."
+
+    # ============================================================
+    # ENSURE non_ab_device.mk (нужен для dumpvars/lunch)
+    # ============================================================
+    - name: Ensure non_ab_device.mk exists
+      run: |
+        set +e
+        TARGET_DIR="android-recovery/build/make/target/product"
+        mkdir -p "$TARGET_DIR"
+        if [ -f "$TARGET_DIR/non_ab_device.mk" ] && [ -s "$TARGET_DIR/non_ab_device.mk" ]; then
+          echo "non_ab_device.mk already present ($(stat -c%s "$TARGET_DIR/non_ab_device.mk") bytes)"
+          exit 0
+        fi
+        for url in \
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/non_ab_device.mk" \
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-20.0/target/product/non_ab_device.mk" \
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-19.1/target/product/non_ab_device.mk" \
+          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-18.1/target/product/non_ab_device.mk"; do
+          echo "  [try] $url"
+          if curl -sSL -o "$TARGET_DIR/non_ab_device.mk" "$url" 2>/dev/null && \
+             [ -s "$TARGET_DIR/non_ab_device.mk" ] && \
+             ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null && \
+             grep -q "PRODUCT_PACKAGES" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null; then
+            echo "  [ok] downloaded from $url ($(wc -l < "$TARGET_DIR/non_ab_device.mk") lines)"
+            exit 0
+          fi
+          rm -f "$TARGET_DIR/non_ab_device.mk"
+        done
+        echo "ERROR: could not download non_ab_device.mk"
+        exit 1
 
     # ============================================================
     # GENERATE TREE
@@ -374,9 +412,10 @@ jobs:
         cat AndroidProducts.mk || true
 
     # ============================================================
-    # AUTO-RESOLVE MISSING DEPENDENCIES
+    # AUTO-RESOLVE MISSING DEPENDENCIES (только если ALLOW_LINEAGE_DEPS)
     # ============================================================
     - name: Auto-resolve missing dependencies
+      if: inputs.ALLOW_LINEAGE_DEPS == true
       run: |
         set +e
         cd android-recovery || exit 1
@@ -395,8 +434,9 @@ jobs:
         echo "Primary LOS branch: $LOS_BRANCH | Fallbacks: $ALT_BRANCHES"
         export LOS_BRANCH ALT_BRANCHES
 
-        if [ -f ".repo/local_manifests/roomservice.xml" ]; then
-          echo "Removing roomservice.xml to avoid missing-repo sync errors..."
+        # roomservice.xml НЕ удаляем для PBRP (он нужен при lunch/dumpvars)
+        if [ "${{ inputs.RECOVERY_TYPE }}" != "pbrp" ] && [ -f ".repo/local_manifests/roomservice.xml" ]; then
+          echo "Removing roomservice.xml..."
           rm -f ".repo/local_manifests/roomservice.xml" || true
         fi
 
@@ -487,60 +527,22 @@ jobs:
           done
         fi
 
-        NON_AB_URLS=(
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-20.0/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-19.1/target/product/non_ab_device.mk"
-          "https://raw.githubusercontent.com/LineageOS/android_build/lineage-18.1/target/product/non_ab_device.mk"
-        )
-
-        TARGET_DIR="build/make/target/product"
-        if [ ! -f "$TARGET_DIR/non_ab_device.mk" ]; then
-          echo "Downloading real non_ab_device.mk from LineageOS..."
-          mkdir -p "$TARGET_DIR" || true
-          DOWNLOADED=0
-          for url in "${NON_AB_URLS[@]}"; do
-            echo "  [try] $url"
-            if curl -sSL -o "$TARGET_DIR/non_ab_device.mk" "$url" 2>/dev/null; then
-              if [ -s "$TARGET_DIR/non_ab_device.mk" ] && \
-                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null && \
-                 grep -q "PRODUCT_PACKAGES" "$TARGET_DIR/non_ab_device.mk" 2>/dev/null; then
-                echo "  [ok] downloaded non_ab_device.mk ($(wc -l < "$TARGET_DIR/non_ab_device.mk") lines, $(stat -c%s "$TARGET_DIR/non_ab_device.mk") bytes)"
-                DOWNLOADED=1
-                break
-              else
-                echo "  [skip] invalid content from this URL"
-                rm -f "$TARGET_DIR/non_ab_device.mk"
-              fi
+        # --- hardware/qcom-caf/common принудительно ---
+        if [ ! -f "hardware/qcom-caf/common/common.mk" ]; then
+          echo "Forcing clone of hardware/qcom-caf/common..."
+          mkdir -p hardware/qcom-caf/common
+          for b in "$LOS_BRANCH" $ALT_BRANCHES; do
+            if git clone --depth=1 -b "$b" \
+              https://github.com/LineageOS/android_hardware_qcom-caf_common.git \
+              hardware/qcom-caf/common 2>/dev/null; then
+              echo "  [ok] hardware/qcom-caf/common ($b)"
+              break
             fi
+            rm -rf hardware/qcom-caf/common
           done
-          if [ "$DOWNLOADED" = "0" ]; then
-            echo "ERROR: could not download non_ab_device.mk from any URL"
-            exit 1
-          fi
-        else
-          echo "non_ab_device.mk already exists (size: $(stat -c%s "$TARGET_DIR/non_ab_device.mk") bytes)"
         fi
 
-        if [ "${{ inputs.IS_AB_DEVICE }}" = "true" ]; then
-          AB_URLS=(
-            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-21.0/target/product/virtual_ab_ota.mk"
-            "https://raw.githubusercontent.com/LineageOS/android_build/lineage-20.0/target/product/virtual_ab_ota.mk"
-          )
-          if [ ! -f "$TARGET_DIR/virtual_ab_ota.mk" ]; then
-            echo "Downloading virtual_ab_ota.mk (A/B device)..."
-            for url in "${AB_URLS[@]}"; do
-              if curl -sSL -o "$TARGET_DIR/virtual_ab_ota.mk" "$url" 2>/dev/null && \
-                 [ -s "$TARGET_DIR/virtual_ab_ota.mk" ] && \
-                 ! grep -q "<!DOCTYPE html>" "$TARGET_DIR/virtual_ab_ota.mk" 2>/dev/null; then
-                echo "  [ok] downloaded virtual_ab_ota.mk"
-                break
-              fi
-              rm -f "$TARGET_DIR/virtual_ab_ota.mk" 2>/dev/null || true
-            done
-          fi
-        fi
-
+        # --- hardware/samsung ---
         if [ ! -d "hardware/samsung" ] || [ -z "$(ls -A hardware/samsung 2>/dev/null)" ]; then
           echo "Cloning hardware/samsung from LineageOS..."
           rm -rf hardware/samsung 2>/dev/null || true
@@ -554,8 +556,7 @@ jobs:
             rm -rf hardware/samsung 2>/dev/null || true
           done
           if [ ! -d "hardware/samsung" ] || [ -z "$(ls -A hardware/samsung 2>/dev/null)" ]; then
-            echo "ERROR: failed to clone hardware/samsung"
-            exit 1
+            echo "WARNING: failed to clone hardware/samsung — continuing"
           fi
         else
           echo "hardware/samsung already exists"
@@ -639,7 +640,17 @@ jobs:
           echo "kernel/samsung/sdm429 already exists"
         fi
 
-        echo "=== Dependency resolution done (real files, not stubs) ==="
+        echo "=== Dependency resolution done ==="
+
+    # ============================================================
+    # SKIP NOTICE (когда ALLOW_LINEAGE_DEPS = false)
+    # ============================================================
+    - name: Skip notice
+      if: inputs.ALLOW_LINEAGE_DEPS != true
+      run: |
+        echo "ALLOW_LINEAGE_DEPS=false — build uses device tree only."
+        echo "Auto-resolver and LineageOS dependencies are skipped."
+        echo "Only non_ab_device.mk was ensured."
 
     # ============================================================
     # PATCH BOARD CONFIG
@@ -835,6 +846,7 @@ jobs:
           Manifest: ${{ inputs.MANIFEST_BRANCH }}
           Generator: ${{ inputs.TREE_GENERATOR }}
           Android: ${{ inputs.ANDROID_VERSION }}
+          Allow Lineage deps: ${{ inputs.ALLOW_LINEAGE_DEPS }}
           Source: ${{ env.COMMIT_ID }}
 
     - name: Summary
@@ -847,6 +859,7 @@ jobs:
           echo "| --- | --- |"
           echo "| Recovery | ${{ inputs.RECOVERY_TYPE }} |"
           echo "| Device | ${{ inputs.DEVICE_NAME }} |"
+          echo "| Allow Lineage deps | ${{ inputs.ALLOW_LINEAGE_DEPS }} |"
           echo "| Manifest | ${{ inputs.MANIFEST_BRANCH }} |"
           echo "| Generator | ${{ inputs.TREE_GENERATOR }} |"
           echo "| Android | ${{ inputs.ANDROID_VERSION }} |"
